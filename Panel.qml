@@ -78,36 +78,23 @@ Panel {
   property bool restartPending: false
   property string saveError: ""
 
-  // ---- File access. Paths are passed to bash as positional arguments, never
-  //      interpolated into the script. Reads require a regular file and are
-  //      capped at 64 KiB; writes go to a temp file in the target directory and
-  //      are renamed into place. A symlinked config is honored only when it
-  //      resolves to a regular file under $HOME.
-
-  readonly property string readScript:
-      '[ -e "$2" ] && echo "__PENDING__"; ' +
-      '[ -f "$1" ] && head -c 65536 -- "$1"; exit 0'
-
-  readonly property string writeScript:
-      'body=$1; conf=$2; target=$conf; ' +
-      'if [ -L "$conf" ]; then target=$(realpath -e -- "$conf") || exit 2; ' +
-      '  case $target in "$HOME"/*) ;; *) exit 2;; esac; fi; ' +
-      'if [ -e "$target" ] && [ ! -f "$target" ]; then exit 3; fi; ' +
-      'dir=$(dirname -- "$target"); mkdir -p -- "$dir" || exit 1; ' +
-      'tmp=$(mktemp -- "$dir/.hyprsunset.conf.XXXXXX") || exit 1; ' +
-      'printf "%s" "$body" > "$tmp" && mv -f -- "$tmp" "$target" || { rm -f -- "$tmp"; exit 1; }; '
+  // ---- File access goes through nightlight-file.pl, which holds the parent
+  //      directory and uses O_NOFOLLOW/O_EXCL + fstat so a swapped pathname
+  //      cannot redirect a read or write. Paths are always passed as
+  //      arguments, never interpolated into a script.
+  readonly property string helper: Qt.resolvedUrl("nightlight-file.pl").toString().replace(/^file:\/\//, "")
 
   // Restart hyprsunset, waiting for the old instance to release the display
-  // before launching the new one. $4 is the pending-restart marker.
+  // before launching the new one. $4 = pending marker, $5 = helper.
   readonly property string restartScript:
       'pkill -x hyprsunset; for i in $(seq 1 30); do pgrep -x hyprsunset >/dev/null || break; sleep 0.1; done; ' +
       'setsid uwsm-app -- hyprsunset >/dev/null 2>&1 & ' +
       'for i in $(seq 1 30); do hyprctl hyprsunset temperature >/dev/null 2>&1 && break; sleep 0.1; done; sleep 0.5; ' +
-      'rm -f -- "$4"; omarchy-shell -q nightlight refresh; '
+      'perl -- "$5" unmark "$4"; omarchy-shell -q nightlight refresh; '
 
   function reload() {
     if (readProc.running) return
-    readProc.command = ["bash", "-c", readScript, "_", confPath, pendingPath]
+    readProc.command = ["perl", "--", helper, "read", confPath, pendingPath]
     readProc.running = true
   }
 
@@ -125,13 +112,13 @@ Panel {
       // Only the temperature moved while the light is on: apply it live so
       // there is no restart flash. hyprsunset does not reread its config, so
       // remember to restart it the next time the light is off (invisible).
-      tail = 'hyprctl hyprsunset temperature "$3" >/dev/null; touch -- "$4"; omarchy-shell -q nightlight refresh'
+      tail = 'hyprctl hyprsunset temperature "$3" >/dev/null; perl -- "$5" mark "$4"; omarchy-shell -q nightlight refresh'
       restartPending = true
     } else {
       tail = restartScript
       restartPending = false
     }
-    saveProc.command = ["bash", "-c", writeScript + tail, "_", body, confPath, String(temp), pendingPath]
+    saveProc.command = ["bash", "-c", 'perl -- "$5" write "$2" "$1" || exit $?; ' + tail, "_", body, confPath, String(temp), pendingPath, helper]
     saveProc.running = true
   }
 
@@ -143,7 +130,7 @@ Panel {
     // back on; the user just turned it off, so keep it off.
     restartProc.command = ["bash", "-c",
       restartScript + 'hyprctl hyprsunset temperature 6500 >/dev/null; omarchy-shell -q nightlight refresh',
-      "_", "", "", "", pendingPath]
+      "_", "", "", "", pendingPath, helper]
     restartProc.running = true
   }
 
@@ -163,6 +150,9 @@ Panel {
 
   Process {
     id: readProc
+    onExited: function(exitCode) {
+      if (exitCode === 3) root.saveError = "Config path is a symlink or not a regular file."
+    }
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
@@ -180,8 +170,7 @@ Panel {
     id: saveProc
     onExited: function(exitCode) {
       root.saving = false
-      if (exitCode === 2) root.saveError = "Config is a symlink outside your home directory; not written."
-      else if (exitCode === 3) root.saveError = "Config path is not a regular file; not written."
+      if (exitCode === 3) root.saveError = "Config path is a symlink or not a regular file; not written."
       else if (exitCode !== 0) root.saveError = "Couldn't write hyprsunset.conf."
       root.reload()
       if (root.service) root.service.refresh()
