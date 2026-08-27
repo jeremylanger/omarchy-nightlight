@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.jeremylanger.nightlight",
+  "name": "Night Light",
+  "version": "1.0.0",
+  "author": "Jeremy Langer",
+  "description": "Night light switch and editable schedule for hyprsunset",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Night Light",
+    "description": "Toggle night light and edit the hyprsunset schedule",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  },
+  "license": "MIT"
+}

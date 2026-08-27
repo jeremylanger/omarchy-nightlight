@@ -1,0 +1,358 @@
+import QtQuick
+import Quickshell
+import Quickshell.Io
+import qs.Commons
+import qs.Ui
+
+Panel {
+  id: root
+  moduleName: "io.github.jeremylanger.nightlight"
+  ipcTarget: "io.github.jeremylanger.nightlight"
+  manageIpc: false
+
+  IpcHandler {
+    target: root.ipcTarget
+    function open(): void { root.open() }
+    function close(): void { root.close() }
+    function toggle(): void { root.toggle() }
+    function apply(): string { root.editTemperature = root.editTemperature; root.save(true); return "ok" }
+  }
+
+  readonly property color foreground: bar ? bar.foreground : Color.foreground
+  readonly property color dim: Qt.darker(foreground, 1.55)
+  readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
+  readonly property string confPath: Quickshell.env("HOME") + "/.config/hypr/hyprsunset.conf"
+
+  // Live state from the stock nightlight service (what hyprsunset is doing right now).
+  readonly property var service: bar && bar.shell ? bar.shell.firstPartyServiceFor("omarchy.nightlight") : null
+  readonly property bool active: service ? service.enabled : false
+  readonly property var currentTemp: service ? service.temperature : null
+
+  // Schedule as stored in hyprsunset.conf.
+  property string onTime: "20:00"
+  property string offTime: "07:00"
+  property int temperature: 4000
+  property bool parsed: false
+
+  // Edits in progress.
+  property string editOnTime: onTime
+  property string editOffTime: offTime
+  property int editTemperature: temperature
+  readonly property bool dirty: editOnTime !== onTime || editOffTime !== offTime || editTemperature !== temperature
+  readonly property bool validTimes: /^([01]?\d|2[0-3]):[0-5]\d$/.test(editOnTime) && /^([01]?\d|2[0-3]):[0-5]\d$/.test(editOffTime)
+  property bool saving: false
+
+  function parseConf(text) {
+    var blocks = String(text || "").match(/profile\s*\{[^}]*\}/g) || []
+    var on = null, off = null, temp = null
+    for (var i = 0; i < blocks.length; i++) {
+      var b = blocks[i]
+      var t = b.match(/time\s*=\s*(\d{1,2}:\d{2})/)
+      if (!t) continue
+      if (/identity\s*=\s*true/.test(b)) off = t[1]
+      else {
+        var k = b.match(/temperature\s*=\s*(\d+)/)
+        if (k) { on = t[1]; temp = Number(k[1]) }
+      }
+    }
+    if (on) onTime = on
+    if (off) offTime = off
+    if (temp) temperature = temp
+    parsed = true
+    if (!dirtyBeforeReload) resetEdits()
+  }
+  property bool dirtyBeforeReload: false
+
+  function resetEdits() {
+    editOnTime = onTime
+    editOffTime = offTime
+    editTemperature = temperature
+  }
+
+  function pad(t) {
+    var p = t.split(":")
+    return (p[0].length < 2 ? "0" + p[0] : p[0]) + ":" + p[1]
+  }
+
+  readonly property string pendingPath: Quickshell.env("HOME") + "/.local/state/omarchy/nightlight-restart-pending"
+  property bool restartPending: false
+
+  readonly property string restartCmd:
+      "pkill -x hyprsunset; for i in $(seq 1 30); do pgrep -x hyprsunset >/dev/null || break; sleep 0.1; done; " +
+      "setsid uwsm-app -- hyprsunset >/dev/null 2>&1 & " +
+      "for i in $(seq 1 30); do hyprctl hyprsunset temperature >/dev/null 2>&1 && break; sleep 0.1; done; sleep 0.5; " +
+      "rm -f \"" + pendingPath + "\"; omarchy-shell -q nightlight refresh"
+
+  function save(force) {
+    if (!validTimes || saving) return
+    saving = true
+    var on = pad(editOnTime), off = pad(editOffTime), temp = editTemperature
+    var timesChanged = on !== pad(onTime) || off !== pad(offTime)
+    var body = "# Night light schedule (edited from the bar widget)\n"
+      + "profile {\n    time = " + off + "\n    identity = true\n}\n\n"
+      + "profile {\n    time = " + on + "\n    temperature = " + temp + "\n}\n"
+    var write = "printf '%s' \"$1\" > \"$2\" || exit 1; "
+    if (active && !timesChanged) {
+      // Only the temperature moved while the light is on: apply it live so
+      // there is no restart flash. hyprsunset does not reread its config, so
+      // remember to restart it the next time the light is off (invisible).
+      saveProc.command = ["bash", "-c",
+        write + "hyprctl hyprsunset temperature " + temp + " >/dev/null; touch \"" + pendingPath + "\"; omarchy-shell -q nightlight refresh",
+        "_", body, confPath]
+      restartPending = true
+    } else {
+      saveProc.command = ["bash", "-c", write + restartCmd, "_", body, confPath]
+      restartPending = false
+    }
+    saveProc.running = true
+  }
+
+  function runPendingRestart() {
+    if (!restartPending || active || saving || restartProc.running) return
+    // The fresh instance applies the schedule, which may switch the light
+    // back on; the user just turned it off, so keep it off.
+    restartProc.command = ["bash", "-c", restartCmd + "; hyprctl hyprsunset temperature 6500 >/dev/null; omarchy-shell -q nightlight refresh"]
+    restartProc.running = true
+  }
+
+  onActiveChanged: if (!active) Qt.callLater(runPendingRestart)
+
+  Process {
+    id: restartProc
+    onExited: function() { root.restartPending = false; if (root.service) root.service.refresh() }
+  }
+
+  FileView {
+    id: pendingFile
+    path: root.pendingPath
+    watchChanges: true
+    printErrors: false
+    onLoaded: { root.restartPending = true; Qt.callLater(root.runPendingRestart) }
+    onLoadFailed: root.restartPending = false
+  }
+
+  function setActive(on) {
+    if (!service) return
+    // Turn on with the configured temperature (not the stock 4000K).
+    if (on) service.applyTemperature(temperature)
+    else service.setNightlight(false)
+  }
+
+  FileView {
+    id: confFile
+    path: root.confPath
+    watchChanges: true
+    printErrors: false
+    onFileChanged: { root.dirtyBeforeReload = root.dirty; reload() }
+    onLoaded: root.parseConf(text())
+  }
+
+  Process {
+    id: saveProc
+    onExited: function() {
+      root.saving = false
+      root.dirtyBeforeReload = false
+      confFile.reload()
+      if (root.service) root.service.refresh()
+    }
+  }
+
+  onOpenedChanged: if (opened) {
+    if (service) service.refresh()
+    confFile.reload()
+    Qt.callLater(function() { keyCatcher.forceActiveFocus() })
+  }
+
+  // Hide when off, like the stock indicators: reveal dimmed while the bar's
+  // center section is hovered (or the panel is open), full when active.
+  readonly property bool centerRevealed: bar && bar.centerSectionRevealHeld === true && bar.centerHoverRevealSuppressed !== true
+  readonly property bool shown: active || opened || centerRevealed || button.tooltipHovered
+  visible: shown
+  opacity: active ? 1 : 0.45
+  implicitWidth: shown ? button.implicitWidth : 0
+  implicitHeight: button.implicitHeight
+  Behavior on opacity { NumberAnimation { duration: 120 } }
+
+  BarIconButton {
+    id: button
+    anchors.fill: parent
+    bar: root.bar
+    iconComponent: Component {
+      Item {
+        Text {
+          anchors.centerIn: parent
+          text: "󰔎"
+          color: root.active ? root.barForeground : Qt.darker(root.barForeground, 1.55)
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.icon
+        }
+      }
+    }
+    tooltipText: ""
+    onPressed: function(b) {
+      if (b === Qt.RightButton) root.setActive(!root.active)
+      else root.toggle()
+    }
+  }
+
+  KeyboardPanel {
+    id: panel
+    anchorItem: button
+    owner: root
+    bar: root.bar
+    open: root.opened
+    focusTarget: keyCatcher
+    contentWidth: panel.fittedContentWidth(Style.space(340))
+    contentHeight: panel.fittedContentHeight(column.implicitHeight)
+
+    PanelKeyCatcher {
+      id: keyCatcher
+      anchors.fill: parent
+      blocked: onField.activeFocus || offField.activeFocus || tempField.field.activeFocus
+      onReturnRequested: root.setActive(!root.active)
+      onCloseRequested: root.close()
+      onTabRequested: function(direction) { root.switchPanel(direction) }
+
+      Column {
+        id: column
+        width: parent.width
+        spacing: Style.space(14)
+
+        PanelHero {
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          title: "Night Light"
+          meta: root.active
+            ? ("On · " + (root.currentTemp ? root.currentTemp + "K" : ""))
+            : "Off"
+          iconComponent: Component {
+            Text {
+              text: "󰔎"
+              color: root.active ? root.foreground : root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.display
+            }
+          }
+          trailingControl: Component {
+            ToggleSwitch {
+              checked: root.active
+              foreground: root.foreground
+              onToggled: root.setActive(!root.active)
+            }
+          }
+        }
+
+        PanelSeparator { foreground: root.foreground }
+
+        PanelSectionHeader {
+          text: "SCHEDULE"
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+        }
+
+        Row {
+          spacing: Style.space(16)
+
+          Column {
+            spacing: Style.spacing.md
+            Text {
+              text: "Turns on"
+              color: Qt.darker(root.foreground, 1.4)
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+            TextField {
+              id: onField
+              width: Style.space(80)
+              text: root.editOnTime
+              foreground: root.foreground
+              font.family: root.fontFamily
+              placeholderText: "20:00"
+              onTextEdited: root.editOnTime = text
+              Keys.onPressed: function(e) {
+                if (e.key === Qt.Key_Escape) { keyCatcher.forceActiveFocus(); e.accepted = true }
+                else if (e.key === Qt.Key_Return || e.key === Qt.Key_Enter) { root.save(); e.accepted = true }
+              }
+            }
+          }
+
+          Column {
+            spacing: Style.spacing.md
+            Text {
+              text: "Turns off"
+              color: Qt.darker(root.foreground, 1.4)
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.bodySmall
+            }
+            TextField {
+              id: offField
+              width: Style.space(80)
+              text: root.editOffTime
+              foreground: root.foreground
+              font.family: root.fontFamily
+              placeholderText: "07:00"
+              onTextEdited: root.editOffTime = text
+              Keys.onPressed: function(e) {
+                if (e.key === Qt.Key_Escape) { keyCatcher.forceActiveFocus(); e.accepted = true }
+                else if (e.key === Qt.Key_Return || e.key === Qt.Key_Enter) { root.save(); e.accepted = true }
+              }
+            }
+          }
+
+          NumberField {
+            id: tempField
+            label: "Temperature (K)"
+            from: 1000
+            to: 6000
+            stepSize: 100
+            value: root.editTemperature
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            fieldWidth: Style.space(110)
+            onModified: function(v) { root.editTemperature = v }
+          }
+        }
+
+        Row {
+          spacing: Style.space(8)
+          visible: root.dirty || root.saving
+
+          Button {
+            text: root.saving ? "Saving…" : "Apply"
+            enabled: root.validTimes && !root.saving
+            bordered: true
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            onClicked: root.save()
+          }
+          Button {
+            text: "Reset"
+            enabled: !root.saving
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            onClicked: root.resetEdits()
+          }
+          Text {
+            visible: !root.validTimes
+            anchors.verticalCenter: parent.verticalCenter
+            text: "Use HH:MM"
+            color: root.bar ? root.bar.urgent : Color.urgent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+          }
+        }
+
+        Text {
+          width: parent.width
+          wrapMode: Text.WordWrap
+          text: root.parsed
+            ? ("Applies " + root.temperature + "K at " + root.onTime + ", clears at " + root.offTime + ". Toggling above is temporary until the next scheduled change." + (root.restartPending ? " Schedule reload pending (happens next time the light is off)." : ""))
+            : "Reading ~/.config/hypr/hyprsunset.conf…"
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+      }
+    }
+  }
+}
