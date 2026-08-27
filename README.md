@@ -6,6 +6,7 @@ Omarchy bar widget for the built-in night light (hyprsunset): on/off switch and 
 
 - Click the icon to open the panel; right-click to toggle without opening.
 - Edit turn-on time, turn-off time, and temperature, then Apply. This writes `~/.config/hypr/hyprsunset.conf` and restarts hyprsunset.
+  Writes are atomic (temp file + rename). If the config is a symlink, it is followed only when it resolves to a regular file under your home directory.
 - Changing only the temperature while the light is on applies instantly, with no flash. The hyprsunset restart it needs is deferred until the light is next off.
 - The icon hides when the light is off and reveals on hover, like the stock indicators.
 

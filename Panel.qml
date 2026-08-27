@@ -55,13 +55,13 @@ Panel {
         if (k) { on = t[1]; temp = Number(k[1]) }
       }
     }
+    var wasDirty = dirty
     if (on) onTime = on
     if (off) offTime = off
     if (temp) temperature = temp
     parsed = true
-    if (!dirtyBeforeReload) resetEdits()
+    if (!wasDirty) resetEdits()
   }
-  property bool dirtyBeforeReload: false
 
   function resetEdits() {
     editOnTime = onTime
@@ -76,34 +76,62 @@ Panel {
 
   readonly property string pendingPath: Quickshell.env("HOME") + "/.local/state/omarchy/nightlight-restart-pending"
   property bool restartPending: false
+  property string saveError: ""
 
-  readonly property string restartCmd:
-      "pkill -x hyprsunset; for i in $(seq 1 30); do pgrep -x hyprsunset >/dev/null || break; sleep 0.1; done; " +
-      "setsid uwsm-app -- hyprsunset >/dev/null 2>&1 & " +
-      "for i in $(seq 1 30); do hyprctl hyprsunset temperature >/dev/null 2>&1 && break; sleep 0.1; done; sleep 0.5; " +
-      "rm -f \"" + pendingPath + "\"; omarchy-shell -q nightlight refresh"
+  // ---- File access. Paths are passed to bash as positional arguments, never
+  //      interpolated into the script. Reads require a regular file and are
+  //      capped at 64 KiB; writes go to a temp file in the target directory and
+  //      are renamed into place. A symlinked config is honored only when it
+  //      resolves to a regular file under $HOME.
+
+  readonly property string readScript:
+      '[ -e "$2" ] && echo "__PENDING__"; ' +
+      '[ -f "$1" ] && head -c 65536 -- "$1"; exit 0'
+
+  readonly property string writeScript:
+      'body=$1; conf=$2; target=$conf; ' +
+      'if [ -L "$conf" ]; then target=$(realpath -e -- "$conf") || exit 2; ' +
+      '  case $target in "$HOME"/*) ;; *) exit 2;; esac; fi; ' +
+      'if [ -e "$target" ] && [ ! -f "$target" ]; then exit 3; fi; ' +
+      'dir=$(dirname -- "$target"); mkdir -p -- "$dir" || exit 1; ' +
+      'tmp=$(mktemp -- "$dir/.hyprsunset.conf.XXXXXX") || exit 1; ' +
+      'printf "%s" "$body" > "$tmp" && mv -f -- "$tmp" "$target" || { rm -f -- "$tmp"; exit 1; }; '
+
+  // Restart hyprsunset, waiting for the old instance to release the display
+  // before launching the new one. $4 is the pending-restart marker.
+  readonly property string restartScript:
+      'pkill -x hyprsunset; for i in $(seq 1 30); do pgrep -x hyprsunset >/dev/null || break; sleep 0.1; done; ' +
+      'setsid uwsm-app -- hyprsunset >/dev/null 2>&1 & ' +
+      'for i in $(seq 1 30); do hyprctl hyprsunset temperature >/dev/null 2>&1 && break; sleep 0.1; done; sleep 0.5; ' +
+      'rm -f -- "$4"; omarchy-shell -q nightlight refresh; '
+
+  function reload() {
+    if (readProc.running) return
+    readProc.command = ["bash", "-c", readScript, "_", confPath, pendingPath]
+    readProc.running = true
+  }
 
   function save(force) {
     if (!validTimes || saving) return
     saving = true
+    saveError = ""
     var on = pad(editOnTime), off = pad(editOffTime), temp = editTemperature
     var timesChanged = on !== pad(onTime) || off !== pad(offTime)
     var body = "# Night light schedule (edited from the bar widget)\n"
       + "profile {\n    time = " + off + "\n    identity = true\n}\n\n"
       + "profile {\n    time = " + on + "\n    temperature = " + temp + "\n}\n"
-    var write = "printf '%s' \"$1\" > \"$2\" || exit 1; "
+    var tail
     if (active && !timesChanged) {
       // Only the temperature moved while the light is on: apply it live so
       // there is no restart flash. hyprsunset does not reread its config, so
       // remember to restart it the next time the light is off (invisible).
-      saveProc.command = ["bash", "-c",
-        write + "hyprctl hyprsunset temperature " + temp + " >/dev/null; touch \"" + pendingPath + "\"; omarchy-shell -q nightlight refresh",
-        "_", body, confPath]
+      tail = 'hyprctl hyprsunset temperature "$3" >/dev/null; touch -- "$4"; omarchy-shell -q nightlight refresh'
       restartPending = true
     } else {
-      saveProc.command = ["bash", "-c", write + restartCmd, "_", body, confPath]
+      tail = restartScript
       restartPending = false
     }
+    saveProc.command = ["bash", "-c", writeScript + tail, "_", body, confPath, String(temp), pendingPath]
     saveProc.running = true
   }
 
@@ -113,7 +141,9 @@ Panel {
     if (!restartPending || !service || !service.stateLoaded || active || saving || restartProc.running) return
     // The fresh instance applies the schedule, which may switch the light
     // back on; the user just turned it off, so keep it off.
-    restartProc.command = ["bash", "-c", restartCmd + "; hyprctl hyprsunset temperature 6500 >/dev/null; omarchy-shell -q nightlight refresh"]
+    restartProc.command = ["bash", "-c",
+      restartScript + 'hyprctl hyprsunset temperature 6500 >/dev/null; omarchy-shell -q nightlight refresh',
+      "_", "", "", "", pendingPath]
     restartProc.running = true
   }
 
@@ -131,13 +161,31 @@ Panel {
     onExited: function() { root.restartPending = false; if (root.service) root.service.refresh() }
   }
 
-  FileView {
-    id: pendingFile
-    path: root.pendingPath
-    watchChanges: true
-    printErrors: false
-    onLoaded: { root.restartPending = true; Qt.callLater(root.runPendingRestart) }
-    onLoadFailed: root.restartPending = false
+  Process {
+    id: readProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var raw = String(text || "")
+        var pending = raw.indexOf("__PENDING__") === 0
+        if (pending) raw = raw.replace(/^__PENDING__\n?/, "")
+        root.restartPending = pending
+        root.parseConf(raw)
+        if (pending) Qt.callLater(root.runPendingRestart)
+      }
+    }
+  }
+
+  Process {
+    id: saveProc
+    onExited: function(exitCode) {
+      root.saving = false
+      if (exitCode === 2) root.saveError = "Config is a symlink outside your home directory; not written."
+      else if (exitCode === 3) root.saveError = "Config path is not a regular file; not written."
+      else if (exitCode !== 0) root.saveError = "Couldn't write hyprsunset.conf."
+      root.reload()
+      if (root.service) root.service.refresh()
+    }
   }
 
   function setActive(on) {
@@ -147,28 +195,11 @@ Panel {
     else service.setNightlight(false)
   }
 
-  FileView {
-    id: confFile
-    path: root.confPath
-    watchChanges: true
-    printErrors: false
-    onFileChanged: { root.dirtyBeforeReload = root.dirty; reload() }
-    onLoaded: root.parseConf(text())
-  }
-
-  Process {
-    id: saveProc
-    onExited: function() {
-      root.saving = false
-      root.dirtyBeforeReload = false
-      confFile.reload()
-      if (root.service) root.service.refresh()
-    }
-  }
+  Component.onCompleted: reload()
 
   onOpenedChanged: if (opened) {
     if (service) service.refresh()
-    confFile.reload()
+    reload()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
@@ -351,6 +382,16 @@ Panel {
             font.family: root.fontFamily
             font.pixelSize: Style.font.bodySmall
           }
+        }
+
+        Text {
+          visible: root.saveError !== ""
+          width: parent.width
+          wrapMode: Text.WordWrap
+          text: root.saveError
+          color: root.bar ? root.bar.urgent : Color.urgent
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
         }
 
       }
