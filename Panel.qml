@@ -108,7 +108,9 @@ Panel {
   }
 
   function runPendingRestart() {
-    if (!restartPending || active || saving || restartProc.running) return
+    // Wait for the nightlight service to report real state; before that
+    // `active` is false and a restart here would wrongly force the light off.
+    if (!restartPending || !service || !service.stateLoaded || active || saving || restartProc.running) return
     // The fresh instance applies the schedule, which may switch the light
     // back on; the user just turned it off, so keep it off.
     restartProc.command = ["bash", "-c", restartCmd + "; hyprctl hyprsunset temperature 6500 >/dev/null; omarchy-shell -q nightlight refresh"]
@@ -116,6 +118,13 @@ Panel {
   }
 
   onActiveChanged: if (!active) Qt.callLater(runPendingRestart)
+
+  Timer {
+    interval: 3000
+    repeat: true
+    running: root.restartPending
+    onTriggered: root.runPendingRestart()
+  }
 
   Process {
     id: restartProc
@@ -342,16 +351,6 @@ Panel {
           }
         }
 
-        Text {
-          width: parent.width
-          wrapMode: Text.WordWrap
-          text: root.parsed
-            ? ("Applies " + root.temperature + "K at " + root.onTime + ", clears at " + root.offTime + ". Toggling above is temporary until the next scheduled change." + (root.restartPending ? " Schedule reload pending (happens next time the light is off)." : ""))
-            : "Reading ~/.config/hypr/hyprsunset.conf…"
-          color: root.dim
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
-        }
       }
     }
   }
