@@ -1,9 +1,10 @@
 #!/usr/bin/perl
 # Descriptor-held file access for the Night Light widget.
 #
-# Every operation enters the config's parent directory once (refusing a
-# symlinked parent), then works relative to that directory with O_NOFOLLOW
-# and O_EXCL, and validates what it opened via fstat on the descriptor. A
+# Every operation opens the config's parent directory with O_DIRECTORY and
+# O_NOFOLLOW, verifies that descriptor with fstat, and fchdirs into it; it
+# then works relative to the held directory with O_NOFOLLOW and O_EXCL, and
+# validates each opened file via fstat on its descriptor. A
 # pathname swapped in after the check therefore cannot redirect a read or
 # write, and non-regular files are never read.
 #
@@ -15,18 +16,22 @@
 # Exit codes: 0 ok, 1 error, 3 path is a symlink or not a regular file.
 use strict;
 use warnings;
-use Fcntl qw(O_RDONLY O_WRONLY O_CREAT O_EXCL O_NOFOLLOW O_NONBLOCK :mode);
+use Fcntl qw(O_RDONLY O_WRONLY O_CREAT O_EXCL O_NOFOLLOW O_NONBLOCK O_DIRECTORY :mode);
 use File::Basename qw(dirname basename);
 
 my ($mode, $path, $extra) = @ARGV;
 defined $mode && defined $path or exit 1;
 
+# Open the parent directory itself (no symlink following), verify the opened
+# descriptor is a directory, and fchdir into it. Everything afterwards is
+# relative to that held descriptor, so replacing the pathname cannot redirect it.
 sub enter_dir {
   my ($p) = @_;
   my $dir = dirname($p);
-  my @st = lstat($dir) or return 0;
-  S_ISDIR($st[2]) or return 0;
-  chdir($dir) or return 0;
+  sysopen(my $dh, $dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW) or return 0;
+  my @st = stat($dh);
+  (@st && S_ISDIR($st[2])) or return 0;
+  chdir($dh) or return 0;
   return basename($p);
 }
 
