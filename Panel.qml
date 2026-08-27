@@ -273,6 +273,7 @@ Panel {
             TextField {
               id: onField
               width: Style.space(80)
+              height: tempField.field.height
               text: root.editOnTime
               foreground: root.foreground
               font.family: root.fontFamily
@@ -296,6 +297,7 @@ Panel {
             TextField {
               id: offField
               width: Style.space(80)
+              height: tempField.field.height
               text: root.editOffTime
               foreground: root.foreground
               font.family: root.fontFamily
