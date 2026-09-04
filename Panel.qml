@@ -334,6 +334,37 @@ Panel {
   property bool restartPending: false
   property string saveError: ""
 
+  // ---- Suppressing the schedule -----------------------------------------
+  // A fade puts a profile on the clock every minute, and the fade out walks
+  // the screen back up from the target — so once the config has one, "off"
+  // does not stay off: the next step re-warms the screen within the minute,
+  // and even from outside a window the dawn ramp switches the light back on.
+  // hyprsunset has no way to pause a schedule, so the only honest answer is
+  // to stop the process and bring it back when the schedule agrees with the
+  // user again. Held in a file so it survives a shell restart, and holding a
+  // wall-clock deadline rather than a countdown so it survives sleep too.
+  readonly property string suppressPath: Quickshell.env("HOME") + "/.local/state/omarchy/nightlight-suppressed"
+  property real suppressUntil: 0
+  readonly property bool scheduleSuppressed: suppressUntil > 0
+
+  function nextOccurrence(minutesIntoDay) {
+    var now = new Date()
+    var at = new Date(now)
+    at.setHours(Math.floor(minutesIntoDay / 60) % 24, minutesIntoDay % 60, 0, 0)
+    if (at.getTime() <= now.getTime()) at.setDate(at.getDate() + 1)
+    return at.getTime()
+  }
+
+  // When the running schedule next agrees that the light is off: the identity
+  // profile, which sits at the end of the fade out. Zero when the next thing
+  // the schedule does is a legitimate turn-on, which needs no suppressing.
+  function suppressDeadline() {
+    if (!fade) return 0
+    var identityAt = nextOccurrence(minutesOf(offTime)
+      + effectiveFadeOut(onTime, offTime, fadeMinutes))
+    return identityAt < nextOccurrence(minutesOf(onTime)) ? identityAt : 0
+  }
+
   // ---- File access goes through nightlight-file.pl, which holds the parent
   //      directory and uses O_NOFOLLOW/O_EXCL + fstat so a swapped pathname
   //      cannot redirect a read or write. Paths are always passed as
@@ -411,6 +442,9 @@ Panel {
     var midFade = editFade
       && (inFadeWindow(on, effectiveFade(on, off, editFadeMinutes))
         || inFadeWindow(off, effectiveFadeOut(on, off, editFadeMinutes)))
+    // While suppressed hyprsunset is not running, so the live shortcut has
+    // nothing to talk to; the restart both applies the edit and revives it.
+    if (scheduleSuppressed) { midFade = true; clearSuppression() }
     var tail
     if (active && !timesChanged && !midFade) {
       // Only the temperature moved while the light is on: apply it live so
@@ -426,10 +460,96 @@ Panel {
     saveProc.running = true
   }
 
+  function suppressSchedule() {
+    var deadline = suppressDeadline()
+    if (deadline === 0) { service.setNightlight(false); return }
+    suppressUntil = deadline
+    // Settle on the day temperature *before* killing, and confirm it stuck.
+    // `hyprsunset identity` looks right here but leaves `temperature` reading
+    // back the old warm value, so the service would see the light as on, and
+    // the resulting activeChanged would clear the suppression we are in the
+    // middle of taking. Reading back 6500 keeps every probe in this window
+    // agreeing the light is off, and once the process is gone they fail and
+    // report off anyway.
+    suppressProc.command = ["bash", "-c",
+      'for i in $(seq 1 10); do hyprctl hyprsunset temperature 6500 >/dev/null 2>&1; ' +
+      '[ "$(hyprctl hyprsunset temperature 2>/dev/null | grep -oE "[0-9]+" | head -n1)" = "6500" ] && break; ' +
+      'sleep 0.2; done; pkill -x hyprsunset; ' +
+      'perl -- "$3" write "$2" "$1"; omarchy-shell -q nightlight refresh',
+      "_", String(deadline), suppressPath, helper]
+    suppressProc.running = true
+  }
+
+  // Anything that turns the light back on — our switch, the keybinding, the
+  // stock indicator — hands control back to the schedule. Both of those paths
+  // relaunch hyprsunset themselves, so only the marker needs clearing.
+  function clearSuppression() {
+    if (!scheduleSuppressed) return
+    suppressUntil = 0
+    clearSuppressProc.command = ["perl", "--", helper, "unmark", suppressPath]
+    clearSuppressProc.running = true
+  }
+
+  function resumeScheduleIfDue() {
+    if (!scheduleSuppressed || saving || restartProc.running) return
+    if (Date.now() < suppressUntil) return
+    suppressUntil = 0
+    // The schedule now says off too, so a plain restart lands on identity.
+    restartProc.command = ["bash", "-c", restartScript, "_", "", "", "", suppressPath, helper]
+    restartProc.running = true
+  }
+
+  function readSuppression() {
+    if (suppressReadProc.running) return
+    suppressReadProc.command = ["perl", "--", helper, "read", suppressPath]
+    suppressReadProc.running = true
+  }
+
+  Process { id: suppressProc }
+
+  // The service's own apply relaunches hyprsunset when it is not running, so
+  // killing the moment the light goes off races it and the process comes
+  // straight back. Let that settle, then re-check the conditions rather than
+  // acting on what was true when the light went off.
+  Timer {
+    id: suppressDebounce
+    interval: 2500
+    repeat: false
+    onTriggered: {
+      if (root.active || !root.fade || !root.service) return
+      if (root.service.temperature !== root.service.dayTemperature) return
+      if (root.suppressDeadline() === 0) return
+      root.suppressSchedule()
+    }
+  }
+  Process { id: clearSuppressProc }
+
+  Process {
+    id: suppressReadProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var v = Number(String(text || "").trim())
+        root.suppressUntil = v > 0 ? v : 0
+        if (root.scheduleSuppressed) Qt.callLater(root.resumeScheduleIfDue)
+      }
+    }
+  }
+
+  Timer {
+    interval: 60000
+    repeat: true
+    running: root.scheduleSuppressed
+    onTriggered: root.resumeScheduleIfDue()
+  }
+
   function runPendingRestart() {
     // Wait for the nightlight service to report real state; before that
     // `active` is false and a restart here would wrongly force the light off.
     if (!restartPending || !service || !service.stateLoaded || active || saving || restartProc.running) return
+    // Reviving hyprsunset here would undo a suppression; the resume path
+    // brings it back when the schedule agrees the light is off.
+    if (scheduleSuppressed) return
     // `active` first goes false a couple of steps before a fade-out finishes,
     // when the ramp crosses the service's threshold. Restarting there would
     // force 6500 and cut the tail off the ramp, so wait for a quiet moment.
@@ -443,7 +563,20 @@ Panel {
     restartProc.running = true
   }
 
-  onActiveChanged: if (!active) Qt.callLater(runPendingRestart)
+  onActiveChanged: {
+    // The light coming back on by any route — the keybinding and the stock
+    // indicator both relaunch hyprsunset — means the schedule is running
+    // again and the marker is stale.
+    if (active) { suppressDebounce.stop(); clearSuppression(); return }
+    // Going off is either someone asking for it or the fade out finishing on
+    // its own. Only an explicit off lands exactly on the service's day
+    // temperature; a ramp step never does (the coolest is a few hundred K
+    // short of it), which keeps the last steps of a fade out from being read
+    // as a request and cutting the ramp short.
+    if (fade && service && service.temperature === service.dayTemperature
+      && suppressDeadline() !== 0) suppressDebounce.restart()
+    else Qt.callLater(runPendingRestart)
+  }
 
   Timer {
     interval: 3000
@@ -494,15 +627,22 @@ Panel {
     // Clamped below the service's threshold: the first steps of a ramp are
     // above it, and applying one would leave the service reporting the light
     // off and the switch flipping straight back.
-    if (on) service.applyTemperature(Math.min(rampTemperature(), onThreshold - 1))
-    else service.setNightlight(false)
+    if (on) {
+      clearSuppression()
+      service.applyTemperature(Math.min(rampTemperature(), onThreshold - 1))
+    } else {
+      // Suppression is driven from onActiveChanged rather than here, so that
+      // the keybinding and the stock indicator get it too.
+      service.setNightlight(false)
+    }
   }
 
-  Component.onCompleted: reload()
+  Component.onCompleted: { reload(); readSuppression() }
 
   onOpenedChanged: if (opened) {
     if (service) service.refresh()
     reload()
+    resumeScheduleIfDue()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })
   }
 
