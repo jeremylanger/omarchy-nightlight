@@ -19,7 +19,11 @@ Panel {
     function fade(state: string, minutes: string): string {
       if (state !== "") root.editFade = state === "on" || state === "true" || state === "1"
       var m = Math.round(Number(minutes))
-      if (m >= 5) root.editFadeMinutes = Math.min(240, m)
+      if (m >= root.minFadeMinutes) root.editFadeMinutes = Math.min(root.maxFadeMinutes, m)
+      if (!root.validTimes) { root.resetEdits(); return "error: hyprsunset.conf has no valid schedule" }
+      if (root.saving) { root.resetEdits(); return "error: a save is already running" }
+      // Saving an unchanged schedule would restart hyprsunset for nothing.
+      if (!root.dirty) return "unchanged: " + (root.fade ? "on " + root.fadeMinutes : "off")
       root.save(true)
       return root.editFade ? ("on " + root.editFadeMinutes) : "off"
     }
@@ -67,6 +71,18 @@ Panel {
 
   // hyprsunset times are HH:MM, so one minute is the finest step available.
   readonly property int maxFadeSteps: 60
+
+  // The range the duration field offers, shared with the config parser so a
+  // hand-edited value cannot sit outside what the panel can display.
+  readonly property int minFadeMinutes: 5
+  readonly property int maxFadeMinutes: 240
+
+  // The first-party service reads state back from hyprsunset and calls the
+  // light "on" only below this (NightlightModel.isNightlight: temperature <
+  // IDENTITY_TEMPERATURE). The top of a ramp sits above it, so anything we
+  // apply on the user's behalf has to stay under it or the service reports
+  // the light off and the switch springs back.
+  readonly property int onThreshold: 6000
 
   function minutesOf(t) {
     var p = String(t).split(":")
@@ -220,6 +236,14 @@ Panel {
     return stepAt(steps, Math.floor(elapsed), ramp.from)
   }
 
+  function fadeClampNote() {
+    if (!editFade || !validTimes) return ""
+    var on = pad(editOnTime), off = pad(editOffTime)
+    if (effectiveFade(on, off, editFadeMinutes) >= editFadeMinutes
+      && effectiveFadeOut(on, off, editFadeMinutes) >= editFadeMinutes) return ""
+    return "Shortened to fit between " + on + " and " + off + "."
+  }
+
   // Blackbody approximation (Tanner Helland's fit) — close enough to show
   // what the ramp looks like, which is all the swatch is for.
   function kelvinColor(k) {
@@ -267,22 +291,27 @@ Panel {
       if (mFadeOn) fadeOn = mFadeOn === "true"
     }
 
+    var fallbackOn = null, fallbackTemp = null
     var blocks = raw.match(/profile\s*\{[^}]*\}/g) || []
     for (var i = 0; i < blocks.length; i++) {
       var b = blocks[i]
       var t = b.match(/time\s*=\s*(\d{1,2}:\d{2})/)
       if (!t) continue
       if (/identity\s*=\s*true/.test(b)) { if (!off) off = t[1] }
-      else {
+      else if (on === null && temp === null) {
+        // Last one wins, as before the fade: on a generated config that has
+        // lost its header this at least lands on the real target temperature.
         var k = b.match(/temperature\s*=\s*(\d+)/)
-        if (k && on === null && temp === null) { on = t[1]; temp = Number(k[1]) }
+        if (k) { fallbackOn = t[1]; fallbackTemp = Number(k[1]) }
       }
     }
+    if (on === null) on = fallbackOn
+    if (temp === null) temp = fallbackTemp
     var wasDirty = dirty
     if (on) onTime = on
     if (off) offTime = off
     if (temp) temperature = temp
-    if (fadeMin) fadeMinutes = fadeMin
+    if (fadeMin) fadeMinutes = Math.max(minFadeMinutes, Math.min(maxFadeMinutes, fadeMin))
     fade = fadeOn === true
     parsed = true
     if (!wasDirty) resetEdits()
@@ -370,7 +399,12 @@ Panel {
     saving = true
     saveError = ""
     var on = pad(editOnTime), off = pad(editOffTime), temp = editTemperature
+    // Every step of a fade is derived from the target, so changing it
+    // invalidates the schedule the running hyprsunset holds. Taking the live
+    // shortcut there would leave it ramping to the old target on the far side
+    // of the night — the exact jump the fade exists to remove.
     var timesChanged = on !== pad(onTime) || off !== pad(offTime) || fadeDirty
+      || (editFade && temp !== temperature)
     var body = buildConf(on, off, temp, editFade, editFadeMinutes)
     // Mid-fade, the live shortcut below would jump the screen to the target and
     // skip the rest of the ramp, so let the restart re-derive the right step.
@@ -396,6 +430,11 @@ Panel {
     // Wait for the nightlight service to report real state; before that
     // `active` is false and a restart here would wrongly force the light off.
     if (!restartPending || !service || !service.stateLoaded || active || saving || restartProc.running) return
+    // `active` first goes false a couple of steps before a fade-out finishes,
+    // when the ramp crosses the service's threshold. Restarting there would
+    // force 6500 and cut the tail off the ramp, so wait for a quiet moment.
+    if (fade && (inFadeWindow(onTime, effectiveFade(onTime, offTime, fadeMinutes))
+      || inFadeWindow(offTime, effectiveFadeOut(onTime, offTime, fadeMinutes)))) return
     // The fresh instance applies the schedule, which may switch the light
     // back on; the user just turned it off, so keep it off.
     restartProc.command = ["bash", "-c",
@@ -452,7 +491,10 @@ Panel {
     // Turn on with the configured temperature (not the stock 4000K) — or, if
     // the fade is under way, with the step the ramp has reached, so flipping
     // the switch on mid-fade does not jump straight to the target.
-    if (on) service.applyTemperature(rampTemperature())
+    // Clamped below the service's threshold: the first steps of a ramp are
+    // above it, and applying one would leave the service reporting the light
+    // off and the switch flipping straight back.
+    if (on) service.applyTemperature(Math.min(rampTemperature(), onThreshold - 1))
     else service.setNightlight(false)
   }
 
@@ -640,8 +682,8 @@ Panel {
           NumberField {
             id: fadeField
             label: "Over (min)"
-            from: 5
-            to: 240
+            from: root.minFadeMinutes
+            to: root.maxFadeMinutes
             stepSize: 5
             value: root.editFadeMinutes
             enabled: root.editFade
@@ -791,12 +833,15 @@ Panel {
             }
           }
 
+          // A ramp with no room at all is unreachable — the night and the day
+          // always sum to the full 1440, so one end can always fade. A ramp
+          // *clamped* short is reachable, and is what needs saying.
           Text {
-            visible: root.editFade && root.validTimes && root.fadeRamps.length === 0
+            text: root.fadeClampNote()
+            visible: text !== ""
             width: parent.width
             wrapMode: Text.WordWrap
-            text: "No room to fade between these times."
-            color: root.bar ? root.bar.urgent : Color.urgent
+            color: Qt.darker(root.foreground, 1.5)
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
           }
