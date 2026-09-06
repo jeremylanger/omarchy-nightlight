@@ -20,7 +20,7 @@ Omarchy bar widget for the built-in night light (hyprsunset): on/off switch and 
 omarchy plugin add https://github.com/jeremylanger/omarchy-nightlight --enable
 ```
 
-Optional: remove the stock night light indicator so this one takes its place. In `~/.config/omarchy/shell.json`, set `items` on the `omarchy.indicators` entry to exclude `NightLight`, then place this widget next to it:
+Optional: remove the stock night light *indicator* from the bar so this one takes its place — but keep the stock night light plugin itself enabled, since this widget drives hyprsunset through it. In `~/.config/omarchy/shell.json`, set `items` on the `omarchy.indicators` entry to exclude `NightLight`, then place this widget next to it:
 
 ```bash
 omarchy bar move io.github.jeremylanger.nightlight --section center
@@ -49,7 +49,7 @@ omarchy-shell io.github.jeremylanger.nightlight fade on 60   # or: fade off ""
 
 ## Dependencies
 
-Omarchy (Quattro or newer), hyprsunset, and perl — all part of a stock install. No external services.
+Omarchy (Quattro or newer), hyprsunset, and perl — all part of a stock install. No external services. The stock `omarchy.nightlight` plugin must remain enabled: this widget replaces only its bar indicator, not the service itself.
 
 ## License
 
