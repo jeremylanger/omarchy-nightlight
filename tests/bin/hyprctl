@@ -1,0 +1,14 @@
+#!/bin/sh
+# Stands in for `hyprctl hyprsunset ...` so the tests never touch the real
+# display. State lives under $FAKE_HYPRSUNSET: `running` while the fake
+# hyprsunset is up, `temperature` for what it holds.
+state=${FAKE_HYPRSUNSET:?}
+[ "$1" = hyprsunset ] || exit 1
+[ -e "$state/running" ] || { echo "no such instance"; exit 1; }
+case $2 in
+  temperature)
+    if [ -n "${3:-}" ]; then printf '%s\n' "$3" >"$state/temperature"; echo ok
+    else cat "$state/temperature"; fi ;;
+  identity) echo 6500 >"$state/temperature"; echo ok ;;
+  *) exit 1 ;;
+esac

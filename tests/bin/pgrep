@@ -1,0 +1,3 @@
+#!/bin/sh
+if [ "$*" = "-x hyprsunset" ]; then [ -e "${FAKE_HYPRSUNSET:?}/running" ]; exit; fi
+exec /usr/bin/pgrep "$@"

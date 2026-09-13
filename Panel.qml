@@ -34,9 +34,9 @@ Panel {
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
   readonly property string confPath: Quickshell.env("HOME") + "/.config/hypr/hyprsunset.conf"
 
-  // Live state from the stock nightlight service (what hyprsunset is doing right now).
-  readonly property var service: bar && bar.shell ? bar.shell.firstPartyServiceFor("omarchy.nightlight") : null
-  readonly property bool active: service ? service.enabled : false
+  // Live state: what hyprsunset is doing right now.
+  HyprsunsetState { id: hyprsunset }
+  readonly property bool active: hyprsunset.lightOn
 
   // Schedule as stored in hyprsunset.conf.
   property string onTime: "20:00"
@@ -77,12 +77,11 @@ Panel {
   readonly property int minFadeMinutes: 5
   readonly property int maxFadeMinutes: 240
 
-  // The first-party service reads state back from hyprsunset and calls the
-  // light "on" only below this (NightlightModel.isNightlight: temperature <
-  // IDENTITY_TEMPERATURE). The top of a ramp sits above it, so anything we
-  // apply on the user's behalf has to stay under it or the service reports
-  // the light off and the switch springs back.
-  readonly property int onThreshold: 6000
+  // hyprsunset reads as "on" only below this (HyprsunsetState, matching the
+  // stock service's NightlightModel.isNightlight). The top of a ramp sits
+  // above it, so anything we apply on the user's behalf has to stay under it
+  // or the state reads back off and the switch springs back.
+  readonly property int onThreshold: hyprsunset.identityTemperature
 
   function minutesOf(t) {
     var p = String(t).split(":")
@@ -462,11 +461,11 @@ Panel {
 
   function suppressSchedule() {
     var deadline = suppressDeadline()
-    if (deadline === 0) { service.setNightlight(false); return }
+    if (deadline === 0) { hyprsunset.applyTemperature(hyprsunset.dayTemperature); return }
     suppressUntil = deadline
     // Settle on the day temperature *before* killing, and confirm it stuck.
     // `hyprsunset identity` looks right here but leaves `temperature` reading
-    // back the old warm value, so the service would see the light as on, and
+    // back the old warm value, so the probe would see the light as on, and
     // the resulting activeChanged would clear the suppression we are in the
     // middle of taking. Reading back 6500 keeps every probe in this window
     // agreeing the light is off, and once the process is gone they fail and
@@ -505,9 +504,9 @@ Panel {
     suppressReadProc.running = true
   }
 
-  Process { id: suppressProc }
+  Process { id: suppressProc; onExited: hyprsunset.refresh() }
 
-  // The service's own apply relaunches hyprsunset when it is not running, so
+  // Turning the light off relaunches hyprsunset when it is not running, so
   // killing the moment the light goes off races it and the process comes
   // straight back. Let that settle, then re-check the conditions rather than
   // acting on what was true when the light went off.
@@ -516,8 +515,8 @@ Panel {
     interval: 2500
     repeat: false
     onTriggered: {
-      if (root.active || !root.fade || !root.service) return
-      if (root.service.temperature !== root.service.dayTemperature) return
+      if (root.active || !root.fade) return
+      if (hyprsunset.temperature !== hyprsunset.dayTemperature) return
       if (root.suppressDeadline() === 0) return
       root.suppressSchedule()
     }
@@ -544,14 +543,14 @@ Panel {
   }
 
   function runPendingRestart() {
-    // Wait for the nightlight service to report real state; before that
-    // `active` is false and a restart here would wrongly force the light off.
-    if (!restartPending || !service || !service.stateLoaded || active || saving || restartProc.running) return
+    // Wait for the first probe of hyprsunset; before that `active` is false
+    // and a restart here would wrongly force the light off.
+    if (!restartPending || !hyprsunset.stateLoaded || active || saving || restartProc.running) return
     // Reviving hyprsunset here would undo a suppression; the resume path
     // brings it back when the schedule agrees the light is off.
     if (scheduleSuppressed) return
     // `active` first goes false a couple of steps before a fade-out finishes,
-    // when the ramp crosses the service's threshold. Restarting there would
+    // when the ramp crosses the on threshold. Restarting there would
     // force 6500 and cut the tail off the ramp, so wait for a quiet moment.
     if (fade && (inFadeWindow(onTime, effectiveFade(onTime, offTime, fadeMinutes))
       || inFadeWindow(offTime, effectiveFadeOut(onTime, offTime, fadeMinutes)))) return
@@ -569,11 +568,11 @@ Panel {
     // again and the marker is stale.
     if (active) { suppressDebounce.stop(); clearSuppression(); return }
     // Going off is either someone asking for it or the fade out finishing on
-    // its own. Only an explicit off lands exactly on the service's day
+    // its own. Only an explicit off lands exactly on the day
     // temperature; a ramp step never does (the coolest is a few hundred K
     // short of it), which keeps the last steps of a fade out from being read
     // as a request and cutting the ramp short.
-    if (fade && service && service.temperature === service.dayTemperature
+    if (fade && hyprsunset.temperature === hyprsunset.dayTemperature
       && suppressDeadline() !== 0) suppressDebounce.restart()
     else Qt.callLater(runPendingRestart)
   }
@@ -587,7 +586,7 @@ Panel {
 
   Process {
     id: restartProc
-    onExited: function() { root.restartPending = false; if (root.service) root.service.refresh() }
+    onExited: function() { root.restartPending = false; hyprsunset.refresh() }
   }
 
   Process {
@@ -615,32 +614,31 @@ Panel {
       if (exitCode === 3) root.saveError = "Config path is a symlink or not a regular file; not written."
       else if (exitCode !== 0) root.saveError = "Couldn't write hyprsunset.conf."
       root.reload()
-      if (root.service) root.service.refresh()
+      hyprsunset.refresh()
     }
   }
 
   function setActive(on) {
-    if (!service) return
     // Turn on with the configured temperature (not the stock 4000K) — or, if
     // the fade is under way, with the step the ramp has reached, so flipping
     // the switch on mid-fade does not jump straight to the target.
-    // Clamped below the service's threshold: the first steps of a ramp are
-    // above it, and applying one would leave the service reporting the light
-    // off and the switch flipping straight back.
+    // Clamped below the on threshold: the first steps of a ramp are above
+    // it, and applying one would leave hyprsunset reading back off and the
+    // switch flipping straight back.
     if (on) {
       clearSuppression()
-      service.applyTemperature(Math.min(rampTemperature(), onThreshold - 1))
+      hyprsunset.applyTemperature(Math.min(rampTemperature(), onThreshold - 1))
     } else {
       // Suppression is driven from onActiveChanged rather than here, so that
       // the keybinding and the stock indicator get it too.
-      service.setNightlight(false)
+      hyprsunset.applyTemperature(hyprsunset.dayTemperature)
     }
   }
 
   Component.onCompleted: { reload(); readSuppression() }
 
   onOpenedChanged: if (opened) {
-    if (service) service.refresh()
+    hyprsunset.refresh()
     reload()
     resumeScheduleIfDue()
     Qt.callLater(function() { keyCatcher.forceActiveFocus() })

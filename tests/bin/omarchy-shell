@@ -1,0 +1,3 @@
+#!/bin/sh
+# Keeps the tests from poking the live shell's stock night light service.
+exit 0

@@ -1,0 +1,5 @@
+#!/bin/sh
+# Only ever asked to launch hyprsunset; a fresh one starts at daylight.
+state=${FAKE_HYPRSUNSET:?}
+echo 6500 >"$state/temperature"
+touch "$state/running"
