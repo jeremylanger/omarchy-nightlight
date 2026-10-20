@@ -1,19 +1,21 @@
 #!/usr/bin/perl
 # Descriptor-held file access for the Night Light widget.
 #
-# Every operation opens the config's parent directory with O_DIRECTORY and
-# O_NOFOLLOW, verifies that descriptor with fstat, and fchdirs into it; it
-# then works relative to the held directory with O_NOFOLLOW and O_EXCL, and
-# validates each opened file via fstat on its descriptor. A
-# pathname swapped in after the check therefore cannot redirect a read or
-# write, and non-regular files are never read.
+# Every operation walks down from / one component at a time, opening each
+# directory relative to the one before with O_DIRECTORY and O_NOFOLLOW,
+# verifying that descriptor with fstat, and fchdiring into it. No symlink is
+# followed anywhere on the path, ancestors included. It then works relative to
+# the held parent with O_NOFOLLOW and O_EXCL, and validates each opened file
+# via fstat on its descriptor. A pathname swapped in after the check therefore
+# cannot redirect a read or write, and non-regular files are never read.
 #
 #   read   <conf> <marker>   print "__PENDING__\n" if marker exists, then up to 64 KiB of conf
 #   write  <conf> <body>     atomically replace conf with body
 #   mark   <marker>          create marker
 #   unmark <marker>          remove marker
 #
-# Exit codes: 0 ok, 1 error, 3 path is a symlink or not a regular file.
+# Paths must be absolute. Exit codes: 0 ok, 1 error, 3 path (or a directory
+# above it) is a symlink or not of the expected type.
 use strict;
 use warnings;
 use Fcntl qw(O_RDONLY O_WRONLY O_CREAT O_EXCL O_NOFOLLOW O_NONBLOCK O_DIRECTORY :mode);
@@ -22,16 +24,22 @@ use File::Basename qw(dirname basename);
 my ($mode, $path, $extra) = @ARGV;
 defined $mode && defined $path or exit 1;
 
-# Open the parent directory itself (no symlink following), verify the opened
-# descriptor is a directory, and fchdir into it. Everything afterwards is
-# relative to that held descriptor, so replacing the pathname cannot redirect it.
+# Walk from / to the parent directory, opening every component with
+# O_NOFOLLOW relative to the directory already held, and fchdir into each.
+# Everything afterwards is relative to that held descriptor, so replacing any
+# component of the pathname, or symlinking one, cannot redirect it.
 sub enter_dir {
   my ($p) = @_;
-  my $dir = dirname($p);
-  sysopen(my $dh, $dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW) or return 0;
-  my @st = stat($dh);
-  (@st && S_ISDIR($st[2])) or return 0;
+  $p =~ m{^/} or return 0;
+  sysopen(my $dh, '/', O_RDONLY | O_DIRECTORY) or return 0;
   chdir($dh) or return 0;
+  for my $part (grep { length && $_ ne '.' } split m{/}, dirname($p)) {
+    $part eq '..' and return 0;
+    sysopen($dh, $part, O_RDONLY | O_DIRECTORY | O_NOFOLLOW) or return 0;
+    my @st = stat($dh);
+    (@st && S_ISDIR($st[2])) or return 0;
+    chdir($dh) or return 0;
+  }
   return basename($p);
 }
 
@@ -49,8 +57,8 @@ sub write_atomic {
 
 if ($mode eq 'read') {
   if (defined $extra) {
-    my @m = lstat($extra);
-    print "__PENDING__\n" if @m;
+    my $marker = enter_dir($extra);
+    print "__PENDING__\n" if $marker && lstat($marker);
   }
   my $name = enter_dir($path) or exit 3;
   my $fh;

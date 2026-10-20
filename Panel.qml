@@ -364,8 +364,9 @@ Panel {
     return identityAt < nextOccurrence(minutesOf(onTime)) ? identityAt : 0
   }
 
-  // ---- File access goes through nightlight-file.pl, which holds the parent
-  //      directory and uses O_NOFOLLOW/O_EXCL + fstat so a swapped pathname
+  // ---- File access goes through nightlight-file.pl, which walks to the parent
+  //      directory without following any symlink, holds it, and uses
+  //      O_NOFOLLOW/O_EXCL + fstat so a swapped or symlinked pathname
   //      cannot redirect a read or write. Paths are always passed as
   //      arguments, never interpolated into a script.
   readonly property string helper: Qt.resolvedUrl("nightlight-file.pl").toString().replace(/^file:\/\//, "")

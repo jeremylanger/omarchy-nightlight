@@ -8,13 +8,15 @@ set -euo pipefail
 source_root=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 omarchy_shell=/usr/share/omarchy/shell
 
+failed=0
+"$source_root/tests/nightlight-file.sh" || failed=1
+
 # The panel is a layer-shell window, which needs a compositor to exist.
 [[ -n ${WAYLAND_DISPLAY:-} ]] || { echo "run.sh: needs a Wayland session" >&2; exit 1; }
 
 test_root=$(mktemp -d)
 trap 'rm -rf -- "$test_root"' EXIT
 
-failed=0
 for test in "$source_root"/tests/integration/*.qml; do
   name=$(basename -- "$test" .qml)
   work="$test_root/$name"
