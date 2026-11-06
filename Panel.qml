@@ -648,7 +648,7 @@ Panel {
   // Hide when off, like the stock indicators: reveal dimmed while the bar's
   // center section is hovered (or the panel is open), full when active.
   readonly property bool centerRevealed: bar && bar.centerSectionRevealHeld === true && bar.centerHoverRevealSuppressed !== true
-  readonly property bool shown: active || opened || centerRevealed || button.tooltipHovered
+  readonly property bool shown: active || opened || panel.visible || centerRevealed || button.tooltipHovered
   visible: shown
   opacity: active ? 1 : 0.45
   implicitWidth: shown ? button.implicitWidth : 0
