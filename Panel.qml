@@ -744,6 +744,7 @@ Panel {
               id: onField
               width: Style.space(80)
               height: tempField.field.height
+              verticalPadding: 0
               text: root.editOnTime
               foreground: root.foreground
               font.family: root.fontFamily
@@ -768,6 +769,7 @@ Panel {
               id: offField
               width: Style.space(80)
               height: tempField.field.height
+              verticalPadding: 0
               text: root.editOffTime
               foreground: root.foreground
               font.family: root.fontFamily
